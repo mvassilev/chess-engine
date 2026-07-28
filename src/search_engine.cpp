@@ -279,11 +279,18 @@ Value SearchEngine::negamax(std::int32_t depth, std::int32_t ply, Value alpha,
     depth += extension;
     num_extensions += extension;
 
+    bool is_pv = (beta - alpha) > 1;
+
     // Transposition table probe
     bool is_tt_hit;
     tt::TTEntry* tte = tt::TT.probe(pos.key(), is_tt_hit);
 
-    if (is_tt_hit && (ply > 0) && (tte->depth >= depth)) {
+    // PV nodes are exempt from the cutoff: returning the TT score here skips the
+    // move loop, so update_pv never runs and the triangular PV collapses at this
+    // ply (the "one-move PV" seen when re-searching a warm TT). The whole PV path
+    // is PV nodes, so skipping their cutoffs rebuilds the full line for a trivial
+    // node cost.
+    if (is_tt_hit && (ply > 0) && !is_pv && (tte->depth >= depth)) {
         Value tt_score = score_from_tt(tte->score, ply);
 
         if ((tte->flag() == tt::Flag::F_EXACT) ||
@@ -304,8 +311,6 @@ Value SearchEngine::negamax(std::int32_t depth, std::int32_t ply, Value alpha,
     if (depth <= 0) {
         return quiescence(ply, alpha, beta, info);
     }
-
-    bool is_pv = (beta - alpha) > 1;
 
     Value static_eval =
         in_check ? -VALUE_INFINITE : Scorer<SC_ALL>().get_score(pos);
