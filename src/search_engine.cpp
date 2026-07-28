@@ -322,8 +322,11 @@ Value SearchEngine::negamax(std::int32_t depth, std::int32_t ply, Value alpha,
         return beta;
     }
 
-    // Null-move pruning
-    if (can_null && !in_check && (ply > 0) && (depth >= NULL_MOVE_MIN_DEPTH) &&
+    // Null-move pruning (skipped at PV nodes: returning beta here fails the node
+    // high before the move loop, so update_pv never runs — same PV-collapse risk
+    // the TT cutoff has, and NMP is a non-PV technique anyway).
+    if (can_null && !is_pv && !in_check && (ply > 0) &&
+        (depth >= NULL_MOVE_MIN_DEPTH) &&
         (std::abs(beta) < (VALUE_MATE - MAX_PLY)) &&
         (pos.count(stm, KNIGHT, BISHOP, ROOK, QUEEN) > 0)) {
         if (null_move_cuts(depth, ply, beta, info, num_extensions)) {
