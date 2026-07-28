@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.10)
 
 # Project name and version
-project(KhaosChess VERSION 2.15.0 LANGUAGES CXX)
+project(KhaosChess VERSION 2.18.0 LANGUAGES CXX)
 
 # If not explicitly set, default to Release build type
 if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
