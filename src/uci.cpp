@@ -7,8 +7,11 @@
 #include <mutex>
 #include <thread>
 
+#include "datagen.h"
+#include "eval.h"
 #include "move.h"
 #include "movegen.h"
+#include "nnue.h"
 #include "perft.h"
 #include "position.h"
 #include "thread.h"
@@ -242,6 +245,18 @@ void run_search(Position& pos, SearchLimits limits) {
     }
 }
 
+// The identify-and-options block, emitted on startup and on every "uci".
+void print_id_and_options() {
+    std::cout << "id name " << NAME << " " << VERSION << "\n";
+    std::cout << "id author " << AUTHOR << "\n";
+    std::cout << "option name Threads type spin default 1 min 1 max 256\n";
+    std::cout << "option name Hash type spin default 64 min 1 max 4096\n";
+    std::cout << "option name Ponder type check default false\n";
+    std::cout << "option name EvalFile type string default <empty>\n";
+    std::cout << "option name UseNNUE type check default true\n";
+    std::cout << "uciok\n";
+}
+
 /*
         GUI -> isready
         Engine -> readyok
@@ -257,12 +272,7 @@ void uci_loop() {
     // def user/GUI inout buffer
     char input_buffer[INPUT_BUFFER];
 
-    std::cout << "id name " << NAME << "\n";
-    std::cout << "id author " << AUTHOR << "\n";
-    std::cout << "option name Threads type spin default 1 min 1 max 256\n";
-    std::cout << "option name Hash type spin default 64 min 1 max 4096\n";
-    std::cout << "option name Ponder type check default false\n";
-    std::cout << "uciok\n";
+    print_id_and_options();
 
     InfoListPtr infos(new std::deque<MoveInfo>(1));
     Position pos;
@@ -317,11 +327,55 @@ void uci_loop() {
                 // Resize the transposition table to the requested MB. Wipes
                 // its contents, so this is a between-games operation.
                 tt::TT.resize(static_cast<std::size_t>(atoi(val + 6)));
+            } else if (val && strstr(input_buffer, "EvalFile")) {
+                // Trim the value: GUIs pad with spaces and a trailing newline,
+                // and a path is taken verbatim otherwise.
+                std::string path(val + 6);
+                while (!path.empty() && (path.back() == '\n' ||
+                                         path.back() == '\r' ||
+                                         path.back() == ' ')) {
+                    path.pop_back();
+                }
+                std::size_t start = path.find_first_not_of(' ');
+                path = (start == std::string::npos) ? "" : path.substr(start);
+
+                std::lock_guard<std::mutex> io_lock(io_mutex);
+                if (path.empty() || path == "<empty>") {
+                    nnue::unload();
+                    std::cout << "info string EvalFile cleared, using the "
+                                 "hand-crafted evaluation\n";
+                } else {
+                    std::string error;
+                    if (nnue::load(path, error)) {
+                        // The incremental updates were skipped while no net was
+                        // loaded, so this position's accumulator is unbuilt.
+                        // Worker positions are re-set from FEN each search and
+                        // rebuild theirs automatically.
+                        pos.refresh_accumulator();
+                        std::cout << "info string loaded net " << path << "\n";
+                    } else {
+                        std::cout << "info string EvalFile error: " << error
+                                  << "\n";
+                    }
+                }
+            } else if (val && strstr(input_buffer, "UseNNUE")) {
+                nnue::use_nnue = strstr(val, "true") != nullptr;
+                std::lock_guard<std::mutex> io_lock(io_mutex);
+                std::cout << "info string UseNNUE "
+                          << (nnue::use_nnue ? "true" : "false") << "\n";
             }
         }
         // parse UCI "position" command
         else if (strncmp(input_buffer, "position", 8) == 0) {
             parse_position(input_buffer, pos, infos);
+        }
+
+        // NNUE training data generation. Blocks until finished -- this is a
+        // batch job, not something a GUI drives, so it deliberately owns the
+        // process for its duration. Parallelism is one process per core.
+        else if (strncmp(input_buffer, "datagen", 7) == 0) {
+            stop_and_join();
+            datagen::run(datagen::parse_options(input_buffer));
         }
 
         // parse UCI "ucinewgame" command
@@ -367,18 +421,30 @@ void uci_loop() {
 
         // parse UCI "uci" command
         else if (strncmp(input_buffer, "uci", 3) == 0) {
-            std::cout << "\nid name " << NAME << "\n";
-            std::cout << "id author " << AUTHOR << "\n";
-            std::cout << "option name Threads type spin default 1 min 1 max 256\n";
-            std::cout << "option name Hash type spin default 64 min 1 max 4096\n";
-            std::cout << "option name Ponder type check default false\n";
-            std::cout << "uciok\n";
+            std::cout << "\n";
+            print_id_and_options();
         }
 
         // parse debug "eval" command - static evaluation breakdown,
         // optionally for a single component
         else if (strncmp(input_buffer, "eval", 4) == 0) {
             const char* arg = input_buffer + 4;
+
+            // The number the search actually uses, and which path produced it.
+            // One parseable line, so the trainer's cross-check script can
+            // compare it against its own reference implementation -- and skip
+            // the positions where exact endgame knowledge pre-empted the net
+            // rather than reporting them as a mismatch.
+            {
+                Value endgame = Endgames::score(pos);
+                const char* source = (endgame != VALUE_NONE) ? "endgame"
+                                     : nnue::active()        ? "nnue"
+                                                             : "hce";
+
+                std::lock_guard<std::mutex> io_lock(io_mutex);
+                std::cout << "static eval: " << evaluate(pos) << " (" << source
+                          << ")\n";
+            }
 
             if (strstr(arg, "material")) {
                 Scorer<SC_MATERIAL>().print_stats(pos);

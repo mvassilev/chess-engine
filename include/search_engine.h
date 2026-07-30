@@ -53,6 +53,10 @@ class SearchEngine {
     // ignoring the time limit until told otherwise.
     void set_ponder(bool on);
 
+    // Suppress the per-iteration UCI "info" lines. Data generation runs
+    // millions of searches on the main worker and wants none of them reported.
+    void set_quiet(bool on);
+
     // Shared stop flag controls for Lazy SMP
     static void clear_stop();  // lower the flag before a search
     static void stop();        // raise it to halt every thread
@@ -79,6 +83,7 @@ class SearchEngine {
     std::chrono::milliseconds soft_time{0};  // 0 = no soft limit
     std::uint64_t max_nodes;  // 0 = no node limit
     bool ponder_ = false;     // searching on the opponent's clock
+    bool quiet_ = false;      // suppress "info" reporting
 
     bool should_stop;
     std::uint64_t time_checks;

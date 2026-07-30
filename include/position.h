@@ -9,6 +9,7 @@
 #include "defs.h"
 #include "move.h"
 #include "movegen.h"
+#include "nnue.h"
 
 namespace KhaosChess {
 // Empty fen string
@@ -187,6 +188,21 @@ class Position {
     void update_blocks_and_pins(Color c);
     void remove_piece(Square s);
     void place_piece(Piece p, Square s);
+
+    // NNUE hidden state for this position. Maintained incrementally by
+    // place_piece/remove_piece/move_piece, so do_move updates it as a side
+    // effect and undo_move -- which replays the inverse mutations -- restores
+    // it exactly. No accumulator stack and no dirty-piece list: the board
+    // mutators are the single source of truth, so the accumulator cannot drift
+    // out of step with the move logic.
+    const nnue::Accumulator& accumulator() const {
+        return acc;
+    }
+
+    // Rebuild the accumulator from the piece list. Needed after loading a net
+    // mid-game (the incremental updates were skipped while none was loaded)
+    // and used by the tests as the reference the incremental path must match.
+    void refresh_accumulator();
     void calculate_threats();
     void print_attacked_squares(Color c) const;
 
@@ -234,6 +250,8 @@ class Position {
 
     // State info
     MoveInfo* move_info{};
+
+    nnue::Accumulator acc{};
 };
 
 // Calculate game phase (0-24, where 24 is opening, 0 is endgame)
@@ -345,10 +363,18 @@ inline void Position::place_piece(Piece p, Square s) {
 
     piece_count[p]++;
     piece_count[get_piece(get_piece_color(p), ALL_PIECES)]++;
+
+    if (nnue::is_loaded()) {
+        nnue::accumulator_add(acc, p, s);
+    }
 }
 
 inline void Position::remove_piece(Square s) {
     Piece p = piece_board[s];
+
+    if (nnue::is_loaded()) {
+        nnue::accumulator_sub(acc, p, s);
+    }
 
     // Update bitboards
     rm_bit(type[type_of_piece(p)], s);
@@ -365,6 +391,11 @@ inline void Position::remove_piece(Square s) {
 
 inline void Position::move_piece(Square source, Square target) {
     Piece p = piece_board[source];
+
+    if (nnue::is_loaded()) {
+        nnue::accumulator_sub(acc, p, source);
+        nnue::accumulator_add(acc, p, target);
+    }
 
     // Update bitboards
     BITBOARD dest = square_to_BB(source) | square_to_BB(target);

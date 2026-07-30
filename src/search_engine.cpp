@@ -7,6 +7,7 @@
 #include <mutex>
 #include <thread>
 
+#include "eval.h"
 #include "thread.h"
 #include "tt.h"
 
@@ -210,7 +211,7 @@ Value SearchEngine::search(std::int32_t depth, SearchInfo& info) {
             info.completed_depth = current_depth;
             info.score = score;
 
-            if (thread_id == 0) {
+            if ((thread_id == 0) && !quiet_) {
                 report_iteration(info, current_depth, score);
             }
         }
@@ -248,7 +249,7 @@ Value SearchEngine::negamax(std::int32_t depth, std::int32_t ply, Value alpha,
     if (is_time_up()) {
         info.stopped = should_stop = true;
 
-        return Scorer<SC_ALL>().get_score(pos);
+        return evaluate(pos);
     }
 
     info.nodes++;
@@ -313,7 +314,7 @@ Value SearchEngine::negamax(std::int32_t depth, std::int32_t ply, Value alpha,
     }
 
     Value static_eval =
-        in_check ? -VALUE_INFINITE : Scorer<SC_ALL>().get_score(pos);
+        in_check ? -VALUE_INFINITE : evaluate(pos);
 
     // Reverse futility pruning
     if (!is_pv && !in_check && (depth <= RFP_MAX_DEPTH) &&
@@ -439,7 +440,7 @@ Value SearchEngine::quiescence(std::int32_t ply, Value alpha, Value beta,
 
     // Hard safety net for any other pathologically long sequence
     if (ply >= MAX_PLY) {
-        return Scorer<SC_ALL>().get_score(pos);
+        return evaluate(pos);
     }
 
     // Transposition table probe; any stored entry beats a depth-0 search
@@ -466,7 +467,7 @@ Value SearchEngine::quiescence(std::int32_t ply, Value alpha, Value beta,
         pos.get_attackers_to(pos.square<KING>(stm)) & pos.get_pieces_bb(~stm);
 
     if (!in_check) {
-        Value stand_pat = Scorer<SC_ALL>().get_score(pos);
+        Value stand_pat = evaluate(pos);
 
         // Stand-pat cutoff
         if (stand_pat >= beta) {
@@ -665,6 +666,10 @@ void SearchEngine::set_max_nodes(std::uint64_t nodes) {
 
 void SearchEngine::set_ponder(bool on) {
     ponder_ = on;
+}
+
+void SearchEngine::set_quiet(bool on) {
+    quiet_ = on;
 }
 
 // Prepend `move` to the child's line: pv_table[ply] becomes move +

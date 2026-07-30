@@ -119,6 +119,11 @@ Position& Position::set(const std::string& fen, MoveInfo* mi) {
     memset(mi, 0, sizeof(MoveInfo));
     move_info = mi;
 
+    // Seed the accumulator with the feature bias before any place_piece call
+    // below adds to it -- the memset above zeroed it, and an all-zero
+    // accumulator would silently drop the bias term.
+    nnue::accumulator_reset(acc);
+
     side = WHITE;
     size_t idx = 0;
 
@@ -805,6 +810,20 @@ void Position::set_castling_rights(Color c, Square r_source) {
     castling_path[cr] =
         (in_between_bb(r_source, r_target) | in_between_bb(k_source, k_target)) &
         ~k_and_r;
+}
+
+void Position::refresh_accumulator() {
+    if (!nnue::is_loaded()) {
+        return;
+    }
+
+    nnue::accumulator_reset(acc);
+
+    BITBOARD occupied = get_all_pieces_bb();
+    while (occupied) {
+        Square s = pop_ls1b(occupied);
+        nnue::accumulator_add(acc, get_piece_on(s), s);
+    }
 }
 
 void Position::calculate_threats() {
