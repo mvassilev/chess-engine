@@ -9,9 +9,8 @@ namespace KhaosChess {
 namespace nnue {
 
 // ---------------------------------------------------------------------------
-// Network topology
-//
-// (768 -> HIDDEN) x2 -> 1, clipped ReLU.
+// Topology: (768 -> HIDDEN) x2 -> L2 -> 1, clipped ReLU. Only the feature
+// transformer (the accumulator) is incremental; the rest is a dense matmul.
 //
 // The input is the plain "piece on square, from a perspective" feature set:
 //
@@ -28,11 +27,12 @@ namespace nnue {
 // ---------------------------------------------------------------------------
 
 constexpr std::int32_t INPUTS = 768;
-constexpr std::int32_t HIDDEN = 256;
+constexpr std::int32_t HIDDEN = 256;   // feature-transformer / accumulator width
+constexpr std::int32_t L2 = 32;        // post-accumulator hidden layer width
 
-// Quantization scales. Feature weights/biases are stored as round(w * QA), so
-// the accumulator lives on the same scale as a clipped-ReLU output of QA.
-// Output weights are round(w * QB); the output bias is pre-scaled by QA * QB.
+// Quantization. A clipped activation in [0, QA] is a float in [0, 1]. Every
+// post-accumulator layer stores weights as round(w * QB) and bias as
+// round(b * QA * QB); dividing its int32 sum by QB returns to the QA scale.
 constexpr std::int32_t QA = 255;
 constexpr std::int32_t QB = 64;
 
@@ -54,13 +54,12 @@ struct Accumulator {
 // position.h can reach them without a call through a translation unit
 // boundary; treat them as read-only after load.
 struct Network {
-    // [feature][neuron]: feature-major so one feature's contribution is a
-    // contiguous HIDDEN-wide row, which is what the accumulator update adds.
-    alignas(64) std::int16_t feature_weights[INPUTS][HIDDEN];
+    alignas(64) std::int16_t feature_weights[INPUTS][HIDDEN];  // feature-major
     alignas(64) std::int16_t feature_bias[HIDDEN];
-    // [own half][their half] concatenated, so 2 * HIDDEN output weights.
-    alignas(64) std::int16_t output_weights[2 * HIDDEN];
-    std::int32_t output_bias;  // pre-scaled by QA * QB
+    alignas(64) std::int16_t l2_weights[L2][2 * HIDDEN];  // output-major, own|their
+    std::int32_t l2_bias[L2];
+    alignas(64) std::int16_t output_weights[L2];
+    std::int32_t output_bias;
 };
 
 // Non-null only while a net is loaded. Checked on every accumulator update, so
@@ -149,20 +148,22 @@ bool write_random_net(const std::string& path, std::uint64_t seed);
 // trainer repo). All little-endian.
 //
 //   char     magic[8]   "KHAOSNN1"
-//   uint32   version    1
+//   uint32   version    2
 //   uint32   inputs     768
 //   uint32   hidden     256
+//   uint32   l2         32
 //   int32    qa         255
 //   int32    qb         64
 //   int32    eval_scale 1640
-//   int32    reserved[4]
-//   int16    feature_weights[inputs * hidden]   (feature-major)
+//   int32    reserved[3]
+//   int16    feature_weights[inputs * hidden]     (feature-major)
 //   int16    feature_bias[hidden]
-//   int16    output_weights[2 * hidden]
+//   int16    l2_weights[l2 * (2 * hidden)]         (output-major)
+//   int32    l2_bias[l2]
+//   int16    output_weights[l2]
 //   int32    output_bias
-// Not named VERSION: CMake passes -DVERSION="x.y.z" for the UCI id string.
 constexpr char MAGIC[8] = {'K', 'H', 'A', 'O', 'S', 'N', 'N', '1'};
-constexpr std::uint32_t FORMAT_VERSION = 1;
+constexpr std::uint32_t FORMAT_VERSION = 2;
 
 }  // namespace nnue
 }  // namespace KhaosChess

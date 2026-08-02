@@ -41,28 +41,32 @@ std::uint64_t splitmix64(std::uint64_t& state) {
 }  // namespace
 
 Value forward(const Accumulator& acc, Color stm) {
-    const std::int16_t* own = acc.v[stm];
-    const std::int16_t* their = acc.v[~stm];
-
-    // Clipped ReLU to [0, QA], then the int16 x int16 -> int32 output layer.
-    // Widest intermediate is 2 * HIDDEN * QA * max|W2|, comfortably inside
-    // int32 for any sanely trained net.
-    std::int32_t sum = 0;
-
+    // Concatenated clipped activations: own half, then their half.
+    std::int32_t x[2 * HIDDEN];
     for (std::int32_t i = 0; i < HIDDEN; ++i) {
-        const std::int32_t a = std::clamp<std::int32_t>(own[i], 0, QA);
-        sum += a * static_cast<std::int32_t>(net->output_weights[i]);
-    }
-    for (std::int32_t i = 0; i < HIDDEN; ++i) {
-        const std::int32_t a = std::clamp<std::int32_t>(their[i], 0, QA);
-        sum += a * static_cast<std::int32_t>(net->output_weights[HIDDEN + i]);
+        x[i] = std::clamp<std::int32_t>(acc.v[stm][i], 0, QA);
+        x[HIDDEN + i] = std::clamp<std::int32_t>(acc.v[~stm][i], 0, QA);
     }
 
-    sum += net->output_bias;
+    // Hidden layer 2: /QB returns to the QA activation scale, then clip.
+    std::int32_t h[L2];
+    for (std::int32_t j = 0; j < L2; ++j) {
+        std::int32_t sum = net->l2_bias[j];
+        const std::int16_t* row = net->l2_weights[j];
+        for (std::int32_t i = 0; i < 2 * HIDDEN; ++i) {
+            sum += x[i] * static_cast<std::int32_t>(row[i]);
+        }
+        h[j] = std::clamp<std::int32_t>(sum / QB, 0, QA);
+    }
 
-    // Back to engine eval units. int64 because sum * EVAL_SCALE overflows
-    // int32 well before the accumulator itself does.
-    const std::int64_t scaled = static_cast<std::int64_t>(sum) * EVAL_SCALE;
+    // Output layer, then back to engine eval units (int64: out * EVAL_SCALE
+    // overflows int32).
+    std::int32_t out = net->output_bias;
+    for (std::int32_t j = 0; j < L2; ++j) {
+        out += h[j] * static_cast<std::int32_t>(net->output_weights[j]);
+    }
+
+    const std::int64_t scaled = static_cast<std::int64_t>(out) * EVAL_SCALE;
     return static_cast<Value>(scaled / (static_cast<std::int64_t>(QA) * QB));
 }
 
@@ -82,15 +86,16 @@ bool load(const std::string& path, std::string& error) {
     std::uint32_t version = 0;
     std::uint32_t inputs = 0;
     std::uint32_t hidden = 0;
+    std::uint32_t l2 = 0;
     std::int32_t qa = 0;
     std::int32_t qb = 0;
     std::int32_t eval_scale = 0;
-    std::int32_t reserved[4];
+    std::int32_t reserved[3];
 
     if (!read_scalar(in, version) || !read_scalar(in, inputs) ||
-        !read_scalar(in, hidden) || !read_scalar(in, qa) ||
-        !read_scalar(in, qb) || !read_scalar(in, eval_scale) ||
-        !read_array(in, reserved, 4)) {
+        !read_scalar(in, hidden) || !read_scalar(in, l2) ||
+        !read_scalar(in, qa) || !read_scalar(in, qb) ||
+        !read_scalar(in, eval_scale) || !read_array(in, reserved, 3)) {
         error = "truncated header";
         return false;
     }
@@ -101,10 +106,12 @@ bool load(const std::string& path, std::string& error) {
         return false;
     }
     if (inputs != static_cast<std::uint32_t>(INPUTS) ||
-        hidden != static_cast<std::uint32_t>(HIDDEN)) {
+        hidden != static_cast<std::uint32_t>(HIDDEN) ||
+        l2 != static_cast<std::uint32_t>(L2)) {
         error = "topology " + std::to_string(inputs) + "x" +
-                std::to_string(hidden) + ", engine is built for " +
-                std::to_string(INPUTS) + "x" + std::to_string(HIDDEN);
+                std::to_string(hidden) + "x" + std::to_string(l2) +
+                ", engine is built for " + std::to_string(INPUTS) + "x" +
+                std::to_string(HIDDEN) + "x" + std::to_string(L2);
         return false;
     }
     // A mismatch here would silently mis-scale every evaluation, so it is a
@@ -122,7 +129,10 @@ bool load(const std::string& path, std::string& error) {
     if (!read_array(in, &candidate->feature_weights[0][0],
                     static_cast<std::size_t>(INPUTS) * HIDDEN) ||
         !read_array(in, candidate->feature_bias, HIDDEN) ||
-        !read_array(in, candidate->output_weights, 2 * HIDDEN) ||
+        !read_array(in, &candidate->l2_weights[0][0],
+                    static_cast<std::size_t>(L2) * 2 * HIDDEN) ||
+        !read_array(in, candidate->l2_bias, L2) ||
+        !read_array(in, candidate->output_weights, L2) ||
         !read_scalar(in, candidate->output_bias)) {
         error = "truncated weights";
         return false;
@@ -152,58 +162,54 @@ bool write_random_net(const std::string& path, std::uint64_t seed) {
         return false;
     }
 
-    const std::uint32_t inputs = INPUTS;
-    const std::uint32_t hidden = HIDDEN;
-    const std::int32_t qa = QA;
-    const std::int32_t qb = QB;
-    const std::int32_t eval_scale = EVAL_SCALE;
-    const std::int32_t reserved[4] = {0, 0, 0, 0};
-    const std::uint32_t version = FORMAT_VERSION;
+    const std::uint32_t version = FORMAT_VERSION, inputs = INPUTS,
+                        hidden = HIDDEN, l2 = L2;
+    const std::int32_t qa = QA, qb = QB, eval_scale = EVAL_SCALE;
+    const std::int32_t reserved[3] = {0, 0, 0};
 
     out.write(MAGIC, 8);
     out.write(reinterpret_cast<const char*>(&version), sizeof(version));
     out.write(reinterpret_cast<const char*>(&inputs), sizeof(inputs));
     out.write(reinterpret_cast<const char*>(&hidden), sizeof(hidden));
+    out.write(reinterpret_cast<const char*>(&l2), sizeof(l2));
     out.write(reinterpret_cast<const char*>(&qa), sizeof(qa));
     out.write(reinterpret_cast<const char*>(&qb), sizeof(qb));
     out.write(reinterpret_cast<const char*>(&eval_scale), sizeof(eval_scale));
     out.write(reinterpret_cast<const char*>(reserved), sizeof(reserved));
 
     std::uint64_t state = seed;
-
-    // Keep feature weights small: 32 pieces x 2 perspectives must not push the
-    // int16 accumulator anywhere near saturation, which is the same constraint
-    // the trainer enforces by clamping.
-    auto next_feature_weight = [&state]() -> std::int16_t {
-        return static_cast<std::int16_t>(
-            static_cast<std::int32_t>(splitmix64(state) % 129) - 64);
+    auto rnd = [&state](std::int32_t range) -> std::int32_t {
+        return static_cast<std::int32_t>(splitmix64(state) % (2 * range + 1)) -
+               range;
+    };
+    auto dump16 = [&out](const std::vector<std::int16_t>& v) {
+        out.write(reinterpret_cast<const char*>(v.data()),
+                  static_cast<std::streamsize>(v.size() * sizeof(std::int16_t)));
     };
 
+    // Small feature weights so 32 pieces cannot saturate the int16 accumulator.
     std::vector<std::int16_t> feature_weights(
         static_cast<std::size_t>(INPUTS) * HIDDEN);
-    for (auto& w : feature_weights) {
-        w = next_feature_weight();
-    }
-    out.write(reinterpret_cast<const char*>(feature_weights.data()),
-              static_cast<std::streamsize>(feature_weights.size() *
-                                           sizeof(std::int16_t)));
+    for (auto& w : feature_weights) w = static_cast<std::int16_t>(rnd(64));
+    dump16(feature_weights);
 
     std::vector<std::int16_t> feature_bias(HIDDEN);
-    for (auto& b : feature_bias) {
-        b = next_feature_weight();
-    }
-    out.write(reinterpret_cast<const char*>(feature_bias.data()),
-              static_cast<std::streamsize>(feature_bias.size() *
-                                           sizeof(std::int16_t)));
+    for (auto& b : feature_bias) b = static_cast<std::int16_t>(rnd(64));
+    dump16(feature_bias);
 
-    std::vector<std::int16_t> output_weights(2 * HIDDEN);
-    for (auto& w : output_weights) {
-        w = static_cast<std::int16_t>(
-            static_cast<std::int32_t>(splitmix64(state) % 65) - 32);
+    std::vector<std::int16_t> l2_weights(static_cast<std::size_t>(L2) * 2 *
+                                         HIDDEN);
+    for (auto& w : l2_weights) w = static_cast<std::int16_t>(rnd(64));
+    dump16(l2_weights);
+
+    for (std::int32_t j = 0; j < L2; ++j) {
+        const std::int32_t b = rnd(128);
+        out.write(reinterpret_cast<const char*>(&b), sizeof(b));
     }
-    out.write(reinterpret_cast<const char*>(output_weights.data()),
-              static_cast<std::streamsize>(output_weights.size() *
-                                           sizeof(std::int16_t)));
+
+    std::vector<std::int16_t> output_weights(L2);
+    for (auto& w : output_weights) w = static_cast<std::int16_t>(rnd(32));
+    dump16(output_weights);
 
     const std::int32_t output_bias = 0;
     out.write(reinterpret_cast<const char*>(&output_bias), sizeof(output_bias));
